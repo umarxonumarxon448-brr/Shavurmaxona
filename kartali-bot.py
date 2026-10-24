@@ -1,4 +1,4 @@
-import os, threading, logging, asyncio, math, base64, io
+import os, threading, logging, asyncio, math, base64, io, re, json
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import httpx
@@ -28,6 +28,33 @@ MAIN = ReplyKeyboardMarkup([["🍽 Buyurtma berish", "🛒 Savat"], ["📅 Joy b
 CO_PHONE, CO_ADDR, B_PHONE, B_DATE, B_TIME, B_PEOPLE, B_FOOD, R_STARS, R_TEXT, CO_PAY = range(10)
 
 
+def norm_phone(s):
+    s = re.sub(r"[^\d+]", "", s or "")
+    m = re.fullmatch(r"\+?998(\d{9})", s)
+    return "+998" + m.group(1) if m else None
+
+
+BAD_PHONE = "❌ Faqat Oʻzbekiston raqami qabul qilinadi: +998 bilan boshlanishi kerak.\nMasalan: +998901234567"
+
+
+def cat_list(cfg):
+    try:
+        a = json.loads(cfg.get("cats") or "")
+        if a:
+            return a
+    except Exception:
+        pass
+    return [{"n": "Fast food", "t": 1}, {"n": "Ichimliklar", "t": 0}, {"n": "Shirinliklar", "t": 0}]
+
+
+def photo_arg(p):
+    if not p:
+        return None
+    if p.startswith("data:") and "," in p:
+        return base64.b64decode(p.split(",", 1)[1])
+    return p if p.startswith("http") else None
+
+
 def so(n):
     return f"{int(n):,}".replace(",", " ") + " soʻm"
 
@@ -53,21 +80,39 @@ async def start(u: Update, ctx):
 
 # ---------- menyu va savat ----------
 async def menu(u: Update, ctx):
-    cats = sorted({i["category"] for i in await items() if i.get("category")})
-    if not cats:
+    cfg = await get_cfg()
+    have = {i["category"] for i in await items()}
+    cl = [(i, c) for i, c in enumerate(cat_list(cfg)) if c["n"] in have]
+    if not cl:
         await u.message.reply_text("Menyu hozircha boʻsh.")
         return
-    await u.message.reply_text("Boʻlimni tanlang:", reply_markup=IM([[IB(c, callback_data="cat:" + c)] for c in cats]))
+    await u.message.reply_text("Boʻlimni tanlang:", reply_markup=IM([[IB(c["n"], callback_data=f"cat:{i}")] for i, c in cl]))
 
 
 async def on_cat(u: Update, ctx):
     q = u.callback_query
     await q.answer()
-    c = q.data[4:]
-    rows = [[IB(f'{i["name"]} · {so(i["price"])} · {i["minutes"]} daq', callback_data=f'add:{i["id"]}')]
-            for i in await items() if i["category"] == c]
-    rows.append([IB("🛒 Savatni koʻrish", callback_data="cart")])
-    await q.message.reply_text(f"{c}: bosib savatga qoʻshing", reply_markup=IM(rows))
+    try:
+        c = cat_list(await get_cfg())[int(q.data[4:])]
+    except Exception:
+        return
+    chat = q.message.chat_id
+    for i in await items():
+        if i["category"] != c["n"]:
+            continue
+        cap = f'{i["name"]}\n{so(i["price"])}' + (f'\n⏱ {i["minutes"]} daqiqa' if c.get("t") != 0 else "")
+        kb = IM([[IB("➕ Savatga", callback_data=f'add:{i["id"]}')]])
+        ph = photo_arg(i.get("photo"))
+        try:
+            if ph:
+                await ctx.bot.send_photo(chat, photo=ph, caption=cap, reply_markup=kb)
+            else:
+                await ctx.bot.send_message(chat, cap, reply_markup=kb)
+        except Exception:
+            logging.exception("taom rasmi yuborilmadi")
+            await ctx.bot.send_message(chat, cap, reply_markup=kb)
+        await asyncio.sleep(0.3)
+    await ctx.bot.send_message(chat, "Tanlab boʻlgach:", reply_markup=IM([[IB("🛒 Savatni koʻrish", callback_data="cart")]]))
 
 
 async def on_add(u: Update, ctx):
@@ -112,7 +157,11 @@ async def co_start(u: Update, ctx):
 
 
 async def co_phone(u: Update, ctx):
-    ctx.user_data["phone"] = u.message.contact.phone_number if u.message.contact else u.message.text
+    ph = norm_phone(u.message.contact.phone_number if u.message.contact else u.message.text)
+    if not ph:
+        await u.message.reply_text(BAD_PHONE)
+        return CO_PHONE
+    ctx.user_data["phone"] = ph
     kb = ReplyKeyboardMarkup([[KeyboardButton("📍 Lokatsiyani yuborish", request_location=True)]], resize_keyboard=True, one_time_keyboard=True)
     await u.message.reply_text("Manzilni yozing yoki lokatsiya yuboring:", reply_markup=kb)
     return CO_ADDR
@@ -200,7 +249,11 @@ async def b_start(u: Update, ctx):
 
 
 async def b_phone(u: Update, ctx):
-    ctx.user_data["b"] = {"phone": u.message.contact.phone_number if u.message.contact else u.message.text}
+    ph = norm_phone(u.message.contact.phone_number if u.message.contact else u.message.text)
+    if not ph:
+        await u.message.reply_text(BAD_PHONE)
+        return B_PHONE
+    ctx.user_data["b"] = {"phone": ph}
     await u.message.reply_text("Qaysi sana? (masalan 2026-10-25)", reply_markup=ReplyKeyboardRemove())
     return B_DATE
 
@@ -323,6 +376,7 @@ async def watcher(app):
                     logging.exception("xabar yuborilmadi")
                 await sb("PATCH", f"orders?id=eq.{o['id']}", {"notified": st})
             await receipts(app)
+            await admin_alerts(app)
         except Exception:
             logging.exception("watcher")
         await asyncio.sleep(10)
@@ -408,6 +462,26 @@ async def receipts(app):
         except Exception:
             logging.exception("chek yuborilmadi")
         await sb("PATCH", f"orders?id=eq.{o['id']}", {"paid_notified": True})
+
+
+async def admin_alerts(app):
+    """Saytdan kelgan yangi buyurtma haqida oshxonaga Telegram xabari (sayt yopiq boʻlsa ham telefon jiringlaydi)."""
+    if not ADMIN:
+        return
+    try:
+        rows = await sb("GET", "orders?select=*&admin_notified=eq.false&source=neq.telegram")
+        for o in rows or []:
+            ls = o.get("lines") or []
+            txt = (f"🆕 Yangi buyurtma №{o['id']} ({o.get('source')}, {'💳 karta' if o.get('pay_method') == 'karta' else '💵 naqd'})\n"
+                   + "\n".join(f'{l["n"]} × {l["q"]}' for l in ls)
+                   + f"\n{so(o['total'])}\n{o.get('phone')}\n{o.get('address')}")
+            try:
+                await app.bot.send_message(ADMIN, txt)
+            except Exception:
+                logging.exception("admin xabari yuborilmadi")
+            await sb("PATCH", f"orders?id=eq.{o['id']}", {"admin_notified": True})
+    except Exception:
+        logging.exception("admin_alerts")
 
 
 async def on_paid(u: Update, ctx):
