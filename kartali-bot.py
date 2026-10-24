@@ -1,4 +1,4 @@
-import os, threading, logging, asyncio, math, base64
+import os, threading, logging, asyncio, math, base64, io
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import httpx
@@ -6,9 +6,18 @@ from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardB
 from telegram.ext import (Application, CommandHandler, MessageHandler, CallbackQueryHandler,
                           ConversationHandler, ContextTypes, filters)
 
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:  # Pillow yoʻq boʻlsa, chek oddiy matn+QR boʻlib yuboriladi
+    Image = None
+try:
+    import segno
+except ImportError:  # segno yoʻq boʻlsa, havoladan QR yasalmaydi, yuklangan rasm ishlatiladi
+    segno = None
 logging.basicConfig(level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)  # loglarda bot tokeni koʻrinmasin
 TOKEN = os.environ["BOT_TOKEN"]
-SB = os.environ["SUPABASE_URL"].rstrip("/") + "/rest/v1/"
+SB = os.environ["SUPABASE_URL"].split("/rest/v1")[0].rstrip("/") + "/rest/v1/"  # manzil /rest/v1/ bilan yozilsa ham ishlaydi
 KEY = os.environ["SUPABASE_SECRET_KEY"]
 ADMIN = os.environ.get("ADMIN_CHAT_ID")  # ixtiyoriy: yangi buyurtma xabari keladigan chat
 H = {"apikey": KEY, "Content-Type": "application/json"}
@@ -39,7 +48,7 @@ def cart(ctx):
 
 
 async def start(u: Update, ctx):
-    await u.message.reply_text("Xush kelibsiz! Quyidan tanlang 👇", reply_markup=MAIN)
+    await u.message.reply_text(f"Xush kelibsiz! Quyidan tanlang 👇\n\nSizning Telegram ID: {u.effective_user.id}", reply_markup=MAIN)
 
 
 # ---------- menyu va savat ----------
@@ -109,15 +118,31 @@ async def co_phone(u: Update, ctx):
     return CO_ADDR
 
 
+def qr_bytes(cfg):
+    """QR rasm: avval toʻlov havolasidan yasaladi, havola yoʻq boʻlsa admin yuklagan rasm olinadi."""
+    link = (cfg.get("pay_link") or "").strip()
+    if link and segno:
+        try:
+            b = io.BytesIO()
+            segno.make(link, error="m").save(b, kind="png", scale=8, border=2)
+            return b.getvalue()
+        except Exception:
+            logging.exception("QR yasalmadi")
+    q = cfg.get("qrImg") or ""
+    if q.startswith("data:") and "," in q:
+        return base64.b64decode(q.split(",", 1)[1])
+    return None
+
+
 async def get_cfg():
     return {x["key"]: x["value"] for x in (await sb("GET", "settings?select=*") or [])}
 
 
 async def send_qr(bot, chat, text, cfg, markup=None):
     """QR rasm bor boʻlsa rasm + matn, boʻlmasa faqat matn yuboradi."""
-    qr = cfg.get("qrImg") or ""
-    if qr.startswith("data:") and "," in qr:
-        await bot.send_photo(chat, photo=base64.b64decode(qr.split(",", 1)[1]), caption=text[:1024], reply_markup=markup)
+    data = qr_bytes(cfg)
+    if data:
+        await bot.send_photo(chat, photo=data, caption=text[:1024], reply_markup=markup)
     else:
         await bot.send_message(chat, text, reply_markup=markup)
 
@@ -303,6 +328,65 @@ async def watcher(app):
         await asyncio.sleep(10)
 
 
+def _font(size, bold=False):
+    names = ["DejaVuSans-Bold.ttf", "DejaVuSans.ttf"] if bold else ["DejaVuSans.ttf", "DejaVuSans-Bold.ttf"]
+    for n in names:
+        for base in ("", "/usr/share/fonts/truetype/dejavu/", "/usr/share/fonts/dejavu/"):
+            try:
+                return ImageFont.truetype(base + n, size)
+            except Exception:
+                pass
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def _asc(t):
+    return str(t).replace("ʻ", "'").replace("ʼ", "'").replace("‘", "'").replace("’", "'").replace("№", "#")
+
+
+def make_receipt(o, cfg):
+    """Haqiqiy chek: rasm (PNG) va PDF. Ichida buyurtma raqami, taomlar, soni, jami va QR."""
+    W, pad = 640, 40
+    ls = o.get("lines") or []
+    qr = None
+    data = qr_bytes(cfg)
+    if data:
+        try:
+            qr = Image.open(io.BytesIO(data)).convert("RGB")
+            qr.thumbnail((260, 260), Image.NEAREST)
+        except Exception:
+            qr = None
+    img = Image.new("RGB", (W, 700 + 50 * len(ls) + (qr.height if qr else 0)), "white")
+    d = ImageDraw.Draw(img)
+    green = (34, 139, 87)
+    d.rectangle([0, 0, W, 112], fill=green)
+    d.text((pad, 20), _asc(cfg.get("brand") or "Oshxona"), font=_font(36, True), fill="white")
+    d.text((pad, 70), "TO'LOV CHEKI", font=_font(24), fill="white")
+    y = 140
+    d.text((pad, y), "Pul kelib tushdi", font=_font(32, True), fill=green); y += 56
+    d.text((pad, y), f"Buyurtma #{o['id']}", font=_font(28, True), fill="black"); y += 42
+    d.text((pad, y), "Sana: " + (o.get("paid_at") or "")[:16].replace("T", " "), font=_font(22), fill=(90, 90, 90)); y += 50
+    d.line([pad, y, W - pad, y], fill=(200, 200, 200), width=2); y += 18
+    for l in ls:
+        d.text((pad, y), _asc(f"{l['n']} x {l['q']}"), font=_font(24), fill="black")
+        sm = _asc(so(l["q"] * l["p"]))
+        d.text((W - pad - d.textlength(sm, font=_font(24)), y), sm, font=_font(24), fill="black"); y += 46
+    d.line([pad, y, W - pad, y], fill=(200, 200, 200), width=2); y += 20
+    d.text((pad, y), f"Taomlar soni: {sum(l['q'] for l in ls)} ta", font=_font(24), fill="black"); y += 44
+    d.text((pad, y), _asc("JAMI: " + so(o["total"])), font=_font(34, True), fill="black"); y += 70
+    if qr:
+        img.paste(qr, ((W - qr.width) // 2, y)); y += qr.height + 24
+    tx = "Rahmat!"
+    d.text(((W - d.textlength(tx, font=_font(26, True))) / 2, y), tx, font=_font(26, True), fill=green); y += 60
+    img = img.crop((0, 0, W, y))
+    png, pdf = io.BytesIO(), io.BytesIO()
+    img.save(png, "PNG")
+    img.save(pdf, "PDF", resolution=150)
+    return png.getvalue(), pdf.getvalue()
+
+
 async def receipts(app):
     """Sayt/oshxona "💰 Pul keldi" ni bossa, mijozga rasmli chek yuboradi."""
     rows = await sb("GET", "orders?select=*&chat_id=not.is.null&pay_method=eq.karta&paid_at=not.is.null&paid_notified=eq.false")
@@ -315,7 +399,12 @@ async def receipts(app):
                + "\n".join(f'{l["n"]} × {l["q"]}' for l in ls)
                + f"\n\nTaomlar soni: {sum(l['q'] for l in ls)} ta\nJami: {so(o['total'])}\nSana: {(o.get('paid_at') or '')[:10]}")
         try:
-            await send_qr(app.bot, o["chat_id"], txt, cfg)
+            if Image:
+                png, pdf = make_receipt(o, cfg)
+                await app.bot.send_photo(o["chat_id"], photo=png, caption=f"🧾 Chek · Buyurtma №{o['id']}\n✅ Pul kelib tushdi!")
+                await app.bot.send_document(o["chat_id"], document=pdf, filename=f"chek-{o['id']}.pdf")
+            else:
+                await send_qr(app.bot, o["chat_id"], txt, cfg)
         except Exception:
             logging.exception("chek yuborilmadi")
         await sb("PATCH", f"orders?id=eq.{o['id']}", {"paid_notified": True})
