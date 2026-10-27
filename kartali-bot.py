@@ -75,7 +75,33 @@ def cart(ctx):
 
 
 async def start(u: Update, ctx):
+    arg = ctx.args[0] if ctx.args else ""
+    if arg.startswith("login_") and re.fullmatch(r"[a-f0-9]{32}", arg[6:]):  # ilova/saytga Telegram orqali kirish
+        ctx.user_data["login_token"] = arg[6:]
+        kb = ReplyKeyboardMarkup([[KeyboardButton("📱 Raqamni yuborish", request_contact=True)]], resize_keyboard=True, one_time_keyboard=True)
+        await u.message.reply_text("Ilovaga kirish uchun raqamingizni yuboring:", reply_markup=kb)
+        return
     await u.message.reply_text(f"Xush kelibsiz! Quyidan tanlang 👇\n\nSizning Telegram ID: {u.effective_user.id}", reply_markup=MAIN)
+
+
+async def login_contact(u: Update, ctx):
+    """Ilovaga kirish: raqam Telegramning oʻzidan tasdiqlanadi (faqat oʻzining raqami, faqat +998)."""
+    t = ctx.user_data.get("login_token")
+    c = u.message.contact
+    if not t or not c:
+        return  # buyurtma/bron jarayonidagi contact: eski handlerlar hal qiladi
+    ctx.user_data.pop("login_token", None)
+    if c.user_id != u.effective_user.id:
+        await u.message.reply_text("Oʻzingizning raqamingizni yuboring.", reply_markup=MAIN)
+        return
+    phone = norm_phone(c.phone_number)
+    if not phone:
+        await u.message.reply_text(BAD_PHONE, reply_markup=MAIN)
+        return
+    await sb("PATCH", f"tg_logins?token=eq.{t}&status=eq.pending", {
+        "status": "ok", "phone": phone, "name": u.effective_user.full_name,
+        "tg_id": u.effective_user.id, "confirmed_at": datetime.now(timezone.utc).isoformat()})
+    await u.message.reply_text("✅ Kirdingiz! Ilovaga qaytishingiz mumkin.", reply_markup=MAIN)
 
 
 # ---------- menyu va savat ----------
@@ -442,7 +468,7 @@ def make_receipt(o, cfg):
 
 
 async def receipts(app):
-    """Sayt/oshxona "💰 Pul keldi" ni bossa, mijozga rasmli chek yuboradi."""
+   """Sayt/oshxona "💰 Pul keldi" ni bossa, mijozga rasmli chek yuboradi."""
     rows = await sb("GET", "orders?select=*&chat_id=not.is.null&pay_method=eq.karta&paid_at=not.is.null&paid_notified=eq.false")
     if not rows:
         return
@@ -535,6 +561,7 @@ def main():
     app.add_handler(CallbackQueryHandler(show_cart, pattern="^cart$"))
     app.add_handler(CallbackQueryHandler(on_clear, pattern="^clear$"))
     app.add_handler(CallbackQueryHandler(on_paid, pattern="^paid:"))
+    app.add_handler(MessageHandler(filters.CONTACT, login_contact), group=1)  # ilovaga kirish
     app.run_polling()
 
 
