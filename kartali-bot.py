@@ -468,7 +468,7 @@ def make_receipt(o, cfg):
 
 
 async def receipts(app):
-   """Sayt/oshxona "💰 Pul keldi" ni bossa, mijozga rasmli chek yuboradi."""
+  """Sayt/oshxona "💰 Pul keldi" ni bossa, mijozga rasmli chek yuboradi."""
     rows = await sb("GET", "orders?select=*&chat_id=not.is.null&pay_method=eq.karta&paid_at=not.is.null&paid_notified=eq.false")
     if not rows:
         return
